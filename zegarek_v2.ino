@@ -326,23 +326,26 @@ void drawTetris() {
 
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(49, 0);  display.print("TETRIS");
-  display.setCursor(49, 12); display.print("PKT:");
-  display.setCursor(74, 12); display.print(score);
-  display.setCursor(49, 24); display.print("LIN:");
-  display.setCursor(74, 24); display.print(lines);
-  display.setCursor(49, 36); display.print("NEXT");
-  // Podglad kolejnego klocka: 4x4 kratki po 3 piksele.
+  // Na dwukolorowym OLED pierwsze 16 wierszy sa fizycznie zolte.
+  // Tylko napis TETRIS lezy w zoltym pasku bocznego panelu.
+  // Pozostale informacje sa ponizej, w niebieskiej czesci ekranu.
+  display.setCursor(49, 3);  display.print("TETRIS");
+  display.setCursor(49, 18); display.print("PKT:");
+  display.setCursor(74, 18); display.print(score);
+  display.setCursor(49, 30); display.print("LIN:");
+  display.setCursor(74, 30); display.print(lines);
+  display.setCursor(49, 42); display.print("NEXT");
+  // Podglad nastepnego klocka: calkowicie w niebieskiej czesci.
   if (playing) {
     for (int y = 0; y < 4; ++y) {
       for (int x = 0; x < 4; ++x) {
         if (occupied(nextPiece, 0, x, y)) {
-          display.fillRect(91 + x * 3, 35 + y * 3, 2, 2, SSD1306_WHITE);
+          display.fillRect(91 + x * 3, 44 + y * 3, 2, 2, SSD1306_WHITE);
         }
       }
     }
   }
-  display.setCursor(49, 55);
+  display.setCursor(49, 56);
   if (gameOver)         display.print("KONIEC");
   else if (!playing)   display.print("B5 START");
   else if (paused)     display.print("PAUZA");
