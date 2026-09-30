@@ -16,7 +16,7 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
 // ============================================================
 // PRZYCISKI: debouncing, pojedyncze klikniecie, autorepeat,
-// oddzielne rozpoznanie krotkiego i dlugiego B5 w Tetrisie.
+// oddzielne rozpoznanie krotkiego i dlugiego B5 w grach.
 // ============================================================
 constexpr unsigned long DEBOUNCE_MS = 35;
 constexpr unsigned long REPEAT_START_MS = 450;
@@ -79,7 +79,7 @@ void readButtons() {
 // ============================================================
 // CZAS I KALENDARZ: dzialaja niezaleznie od wyswietlanego trybu
 // ============================================================
-enum Mode { CLOCK_MODE, CALENDAR_MODE, TETRIS_MODE };
+enum Mode { CLOCK_MODE, CALENDAR_MODE, TETRIS_MODE, SNAKE_MODE };
 Mode mode = CLOCK_MODE;
 
 int hours = 0, minutes = 0, seconds = 0;
@@ -354,15 +354,186 @@ void drawTetris() {
 }
 
 // ============================================================
+// SNAKE: zolty naglowek (y=0..15) + CALE niebieskie pole gry.
+// Siatka 32x12, komorka 4x4: 128 x 48 pikseli (y=16..63).
+// B1/B2 = skret o 90 stopni WZGLEDEM kierunku weza.
+// B3 = przyspieszenie tylko przez czas przytrzymania.
+// ============================================================
+constexpr uint8_t SNAKE_CELL = 4;
+constexpr uint8_t SNAKE_W = 32;
+constexpr uint8_t SNAKE_H = 12;
+constexpr uint8_t SNAKE_TOP = 16;
+constexpr uint16_t SNAKE_MAX = SNAKE_W * SNAKE_H;
+constexpr unsigned long SNAKE_STEP_MS = 180;
+constexpr unsigned long SNAKE_FAST_STEP_MS = 65;
+
+struct SnakePoint {
+  uint8_t x, y;
+};
+SnakePoint snakeBody[SNAKE_MAX]; // glowa: element 0
+SnakePoint snakeFood = {0, 0};
+uint16_t snakeLength = 0;
+uint16_t snakeScore = 0;
+uint8_t snakeDirection = 1; // 0=gora, 1=prawo, 2=dol, 3=lewo
+bool snakeRunning = false, snakePaused = false;
+bool snakeGameOver = false, snakeWon = false;
+bool snakeTurnQueued = false; // najwyzej jeden skret miedzy krokami
+unsigned long lastSnakeStep = 0;
+
+bool snakeAt(uint8_t x, uint8_t y) {
+  for (uint16_t i = 0; i < snakeLength; ++i) {
+    if (snakeBody[i].x == x && snakeBody[i].y == y) return true;
+  }
+  return false;
+}
+
+void placeSnakeFood() {
+  const uint16_t freeCount = SNAKE_MAX - snakeLength;
+  if (freeCount == 0) {
+    snakeRunning = false;
+    snakeWon = true;
+    return;
+  }
+  // Losujemy rownomiernie sposrod pustych pol, bez petli bez konca.
+  uint16_t target = random(freeCount);
+  for (uint8_t y = 0; y < SNAKE_H; ++y) {
+    for (uint8_t x = 0; x < SNAKE_W; ++x) {
+      if (snakeAt(x, y)) continue;
+      if (target-- == 0) {
+        snakeFood = {x, y};
+        return;
+      }
+    }
+  }
+}
+
+void newSnakeGame() {
+  snakeLength = 4;
+  snakeScore = 0;
+  snakeDirection = 1;
+  snakeRunning = true;
+  snakePaused = false;
+  snakeGameOver = false;
+  snakeWon = false;
+  snakeTurnQueued = false;
+  const uint8_t headX = SNAKE_W / 2;
+  const uint8_t headY = SNAKE_H / 2;
+  for (uint16_t i = 0; i < snakeLength; ++i) {
+    snakeBody[i] = {(uint8_t)(headX - i), headY};
+  }
+  placeSnakeFood();
+  lastSnakeStep = millis();
+}
+
+void snakeTurn(int8_t change) {
+  if (!snakeRunning || snakePaused || snakeTurnQueued) return;
+  // Lewo: -1 (np. prawo -> gora). Prawo: +1 (prawo -> dol).
+  snakeDirection = (snakeDirection + 4 + change) % 4;
+  snakeTurnQueued = true;
+}
+
+void stepSnake() {
+  if (!snakeRunning || snakePaused) return;
+  const int8_t dx[] = {0, 1, 0, -1};
+  const int8_t dy[] = {-1, 0, 1, 0};
+  const int nextX = (int)snakeBody[0].x + dx[snakeDirection];
+  const int nextY = (int)snakeBody[0].y + dy[snakeDirection];
+  snakeTurnQueued = false;
+
+  if (nextX < 0 || nextX >= SNAKE_W || nextY < 0 || nextY >= SNAKE_H) {
+    snakeRunning = false;
+    snakeGameOver = true;
+    return;
+  }
+  const bool eating = (nextX == snakeFood.x && nextY == snakeFood.y);
+  // Wolno wejsc na dawne pole ogona, o ile ogon w tym kroku sie przesunie.
+  const uint16_t checked = eating ? snakeLength : snakeLength - 1;
+  for (uint16_t i = 0; i < checked; ++i) {
+    if (snakeBody[i].x == nextX && snakeBody[i].y == nextY) {
+      snakeRunning = false;
+      snakeGameOver = true;
+      return;
+    }
+  }
+  if (eating && snakeLength < SNAKE_MAX) ++snakeLength;
+  for (int i = snakeLength - 1; i > 0; --i) snakeBody[i] = snakeBody[i - 1];
+  snakeBody[0] = {(uint8_t)nextX, (uint8_t)nextY};
+  if (eating) {
+    ++snakeScore;
+    placeSnakeFood();
+  }
+}
+
+void updateSnake() {
+  if (!snakeRunning || snakePaused) return;
+  const unsigned long now = millis();
+  const unsigned long interval = buttons[2].stable == LOW
+                               ? SNAKE_FAST_STEP_MS : SNAKE_STEP_MS;
+  if (now - lastSnakeStep >= interval) {
+    lastSnakeStep = now;
+    stepSnake();
+  }
+}
+
+void snakeMessage(const char *message) {
+  // Komunikat nakladany tylko wtedy, gdy gra nie jest aktywna.
+  const uint8_t x = 32, y = 34, w = 64, h = 16;
+  display.fillRect(x, y, w, h, SSD1306_BLACK);
+  display.drawRect(x, y, w, h, SSD1306_WHITE);
+  display.setTextSize(1);
+  int16_t textX, textY;
+  uint16_t textW, textH;
+  display.getTextBounds(message, 0, 0, &textX, &textY, &textW, &textH);
+  display.setCursor(x + (w - textW) / 2, y + 4);
+  display.print(message);
+}
+
+void drawSnake() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  // Fizycznie zolty pas OLED (0..15). Obydwa napisy CALKOWICIE w pasie.
+  display.setCursor(0, 3);
+  display.print("SNAKE");
+  display.setCursor(75, 3);
+  display.print("PKT:");
+  display.print(snakeScore);
+  display.drawFastHLine(0, 15, 128, SSD1306_WHITE);
+
+  // Wszystkie pola gry sa niebieskie (y=16..63). Bez marginesow.
+  for (uint16_t i = 0; i < snakeLength; ++i) {
+    const uint8_t px = snakeBody[i].x * SNAKE_CELL;
+    const uint8_t py = SNAKE_TOP + snakeBody[i].y * SNAKE_CELL;
+    if (i == 0) {
+      display.fillRect(px, py, 4, 4, SSD1306_WHITE); // glowa
+    } else {
+      display.fillRect(px, py, 3, 3, SSD1306_WHITE); // segmenty
+    }
+  }
+  if (snakeRunning || snakePaused) {
+    // Jedzenie: kwadrat z pustym srodkiem, odroznialny od weza.
+    display.drawRect(snakeFood.x * 4, SNAKE_TOP + snakeFood.y * 4,
+                     4, 4, SSD1306_WHITE);
+  }
+  if (snakeWon) snakeMessage("WYGRANA!");
+  else if (snakeGameOver) snakeMessage("KONIEC");
+  else if (!snakeRunning) snakeMessage("B5 START");
+  else if (snakePaused) snakeMessage("PAUZA");
+  display.display();
+}
+
+// ============================================================
 // STEROWANIE I PRZELACZANIE TRYBOW
 // ============================================================
 void nextMode() {
   if (mode == CLOCK_MODE) mode = CALENDAR_MODE;
   else if (mode == CALENDAR_MODE) mode = TETRIS_MODE;
+  else if (mode == TETRIS_MODE) mode = SNAKE_MODE;
   else mode = CLOCK_MODE;
-  // Tetris nie opada podczas ogladania zegarka lub kalendarza.
+  // Gry pozostaja zamrozone podczas korzystania z innych trybow.
   lastFall = millis();
   lastSoftDrop = millis();
+  lastSnakeStep = millis();
 }
 
 void handlePress(uint8_t b) {
@@ -384,7 +555,7 @@ void handlePress(uint8_t b) {
       case 3: changeYear(-1); break;
       case 4: changeYear(5); break;
     }
-  } else {  // TETRIS_MODE
+  } else if (mode == TETRIS_MODE) {
     switch (b) {
       case 0: movePiece(-1); break;
       case 1: movePiece(1); break;
@@ -396,6 +567,14 @@ void handlePress(uint8_t b) {
               break;
       // B5 (b==4) jest obslugiwany dopiero przy PUSZCZENIU,
       // aby odroznic krotkie klikniecie od dlugiego przytrzymania.
+    }
+  } else if (mode == SNAKE_MODE) {
+    switch (b) {
+      case 0: snakeTurn(-1); break;  // Skret wzgledem kierunku jazdy
+      case 1: snakeTurn(1);  break;
+      // B3 przyspiesza, dopoki jest trzymany: updateSnake().
+      // B4 celowo nic nie robi.
+      // B5: klik po puszczeniu; przytrzymanie: restart.
     }
   }
 }
@@ -409,6 +588,15 @@ void handleRepeat(uint8_t b) {
     if (b == 0) movePiece(-1);
     if (b == 1) movePiece(1);
     // B4 ma wlasny szybki zegar opadania w updateTetris().
+  }
+}
+
+void shortSnakeButton5() {
+  if (!snakeRunning) {
+    newSnakeGame(); // Start lub nowa gra po porazce.
+  } else {
+    snakePaused = !snakePaused;
+    lastSnakeStep = millis(); // Pelny odstep po wznowieniu.
   }
 }
 
@@ -448,12 +636,17 @@ void loop() {
   }
 
   readButtons();
-  // B5 w Tetrisie: restart na przytrzymanie, akcja krotka dopiero po puszczeniu.
+  // B5 w grach: restart na przytrzymanie, klik dopiero po puszczeniu.
   // Przycisk zmiany trybu B6 dziala na pojedyncze nacisniecie.
   for (uint8_t i = 0; i < 6; ++i) {
-    if (i == 4 && mode == TETRIS_MODE) {
-      if (buttons[i].longEvent) newGame();
-      if (buttons[i].releaseEvent && !buttons[i].longSent) shortTetrisButton5();
+    if (i == 4 && (mode == TETRIS_MODE || mode == SNAKE_MODE)) {
+      if (mode == TETRIS_MODE) {
+        if (buttons[i].longEvent) newGame();
+        if (buttons[i].releaseEvent && !buttons[i].longSent) shortTetrisButton5();
+      } else {
+        if (buttons[i].longEvent) newSnakeGame();
+        if (buttons[i].releaseEvent && !buttons[i].longSent) shortSnakeButton5();
+      }
       continue;
     }
     if (buttons[i].pressEvent) handlePress(i);
@@ -461,6 +654,7 @@ void loop() {
   }
 
   if (mode == TETRIS_MODE) updateTetris();
+  else if (mode == SNAKE_MODE) updateSnake();
 
   // Okolo 20 FPS. Nie wysylamy 1024 bajtow do OLED bez przerwy,
   // wiec odczyt przyciskow i szybkie opadanie pozostaja plynne.
@@ -469,7 +663,8 @@ void loop() {
     lastDraw = millis();
     if (mode == CLOCK_MODE) drawClock();
     else if (mode == CALENDAR_MODE) drawCalendar();
-    else drawTetris();
+    else if (mode == TETRIS_MODE) drawTetris();
+    else drawSnake();
   }
   delay(1);
 }
