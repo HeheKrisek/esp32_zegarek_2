@@ -79,7 +79,7 @@ void readButtons() {
 // ============================================================
 // CZAS I KALENDARZ: dzialaja niezaleznie od wyswietlanego trybu
 // ============================================================
-enum Mode { CLOCK_MODE, CALENDAR_MODE, TETRIS_MODE, SNAKE_MODE };
+enum Mode { CLOCK_MODE, CALENDAR_MODE, TETRIS_MODE, SNAKE_MODE, SOLITAIRE_MODE };
 Mode mode = CLOCK_MODE;
 
 int hours = 0, minutes = 0, seconds = 0;
@@ -523,12 +523,414 @@ void drawSnake() {
 }
 
 // ============================================================
+// PASJANS KLONDIKE (DOBIERANIE PO 1 KARCIE, 52 KARTY)
+// 7 kolumn, 4 stosy docelowe, talon z ponownym rozdaniem.
+// Oznaczenia kart: C=trefl, D=karo, H=kier, S=pik.
+// Ekran dwukolorowy: zolty naglowek y=0..15, cala reszta niebieska.
+// ============================================================
+constexpr uint8_t SOL_STOCK = 0;
+constexpr uint8_t SOL_WASTE = 1;
+constexpr uint8_t SOL_FIRST_FOUNDATION = 2;
+constexpr uint8_t SOL_FIRST_TABLEAU = 6;
+constexpr uint8_t SOL_PILE_COUNT = 13;
+constexpr uint8_t SOL_CARD_W = 16;
+constexpr uint8_t SOL_CARD_H = 11;
+constexpr uint8_t SOL_TABLEAU_Y = 38;
+
+struct SolColumn {
+  uint8_t cards[52];
+  uint8_t count = 0;
+  uint8_t faceUpFrom = 0;  // Wszystkie karty od tego indeksu sa odkryte.
+};
+SolColumn solColumns[7];
+uint8_t solStock[52], solWaste[52];
+uint8_t solStockCount = 0, solWasteCount = 0;
+uint8_t solFoundationRank[4] = {0, 0, 0, 0};
+uint8_t solCursor = SOL_STOCK;
+uint8_t solRun = 1;       // Liczba kart z konca kolumny do przeniesienia.
+int8_t solSource = -1;    // -1 = nic nie trzymamy.
+uint8_t solHeldCount = 0;
+bool solStarted = false, solWon = false;
+uint16_t solMoves = 0;
+
+uint8_t solRank(uint8_t card) { return card % 13 + 1; }
+uint8_t solSuit(uint8_t card) { return card / 13; } // C D H S
+bool solRed(uint8_t card) {
+  const uint8_t suit = solSuit(card);
+  return suit == 1 || suit == 2;
+}
+char solRankChar(uint8_t card) {
+  const uint8_t r = solRank(card);
+  if (r == 1) return 'A';
+  if (r <= 9) return '0' + r;
+  if (r == 10) return 'T';
+  if (r == 11) return 'J';
+  if (r == 12) return 'Q';
+  return 'K';
+}
+char solSuitChar(uint8_t card) {
+  const char suits[] = "CDHS";
+  return suits[solSuit(card)];
+}
+void solCardText(uint8_t card, char *out) {
+  out[0] = solRankChar(card);
+  out[1] = solSuitChar(card);
+  out[2] = '\0';
+}
+
+void newSolitaire() {
+  uint8_t deck[52];
+  for (uint8_t i = 0; i < 52; ++i) deck[i] = i;
+  for (int i = 51; i > 0; --i) {
+    const uint8_t j = random(i + 1);
+    const uint8_t tmp = deck[i];
+    deck[i] = deck[j];
+    deck[j] = tmp;
+  }
+  for (uint8_t c = 0; c < 7; ++c) {
+    solColumns[c].count = c + 1;
+    solColumns[c].faceUpFrom = c;
+  }
+  uint8_t n = 0;
+  // Rozkladamy karty w siedmiu kolumnach: 1,2,...,7.
+  for (uint8_t c = 0; c < 7; ++c) {
+    for (uint8_t i = 0; i <= c; ++i) {
+      solColumns[c].cards[i] = deck[n++];
+    }
+  }
+  solStockCount = 0;
+  while (n < 52) solStock[solStockCount++] = deck[n++];
+  solWasteCount = 0;
+  memset(solFoundationRank, 0, sizeof(solFoundationRank));
+  solCursor = SOL_STOCK;
+  solRun = 1;
+  solSource = -1;
+  solHeldCount = 0;
+  solStarted = true;
+  solWon = false;
+  solMoves = 0;
+}
+
+// Ruchome sa tylko kolejne odkryte karty o malejacych rangach
+// i naprzemiennych kolorach. Zwracamy najdluzszy poprawny ciag
+// zakonczony karta na wierzchu wybranej kolumny.
+uint8_t solMaxRun(uint8_t c) {
+  const SolColumn &col = solColumns[c];
+  if (!col.count) return 0;
+  uint8_t count = 1;
+  for (int i = col.count - 1; i > col.faceUpFrom; --i) {
+    const uint8_t upper = col.cards[i - 1];
+    const uint8_t lower = col.cards[i];
+    if (solRank(upper) != solRank(lower) + 1 ||
+        solRed(upper) == solRed(lower)) break;
+    ++count;
+  }
+  return count;
+}
+
+void solSetCursor(int8_t change) {
+  solCursor = (solCursor + SOL_PILE_COUNT + change) % SOL_PILE_COUNT;
+  if (solSource < 0) solRun = 1;
+}
+
+void solDrawStock() {
+  if (!solStarted || solWon || solSource >= 0) return;
+  if (solStockCount) {
+    solWaste[solWasteCount++] = solStock[--solStockCount];
+    ++solMoves;
+  } else if (solWasteCount) {
+    // Wyczerpany talon: przekladamy caly stos kart odrzuconych
+    // na spod, w odwrotnej kolejnosci (nie tasujemy).
+    uint8_t n = 0;
+    while (solWasteCount) solStock[n++] = solWaste[--solWasteCount];
+    solStockCount = n;
+    ++solMoves;
+  }
+}
+
+bool solTopCard(uint8_t pile, uint8_t &card) {
+  if (pile == SOL_WASTE) {
+    if (!solWasteCount) return false;
+    card = solWaste[solWasteCount - 1];
+    return true;
+  }
+  if (pile >= SOL_FIRST_FOUNDATION && pile < SOL_FIRST_TABLEAU) {
+    const uint8_t suit = pile - SOL_FIRST_FOUNDATION;
+    if (!solFoundationRank[suit]) return false;
+    card = suit * 13 + solFoundationRank[suit] - 1;
+    return true;
+  }
+  if (pile >= SOL_FIRST_TABLEAU && pile < SOL_PILE_COUNT) {
+    const SolColumn &col = solColumns[pile - SOL_FIRST_TABLEAU];
+    if (!col.count) return false;
+    card = col.cards[col.count - 1];
+    return true;
+  }
+  return false;
+}
+
+// Dla kolumny zwraca pierwsza karte (spod) zabieranego ciagu.
+uint8_t solHeldFirst() {
+  if (solSource >= SOL_FIRST_TABLEAU) {
+    const SolColumn &c = solColumns[solSource - SOL_FIRST_TABLEAU];
+    return c.cards[c.count - solHeldCount];
+  }
+  uint8_t card = 0;
+  solTopCard(solSource, card);
+  return card;
+}
+
+void solCancel() {
+  solSource = -1;
+  solHeldCount = 0;
+  solRun = 1;
+}
+
+void solCheckWon() {
+  solWon = true;
+  for (uint8_t s = 0; s < 4; ++s) {
+    if (solFoundationRank[s] != 13) solWon = false;
+  }
+}
+
+void solRemoveFromSource() {
+  if (solSource == SOL_WASTE) {
+    --solWasteCount;
+  } else if (solSource >= SOL_FIRST_FOUNDATION &&
+             solSource < SOL_FIRST_TABLEAU) {
+    --solFoundationRank[solSource - SOL_FIRST_FOUNDATION];
+  } else if (solSource >= SOL_FIRST_TABLEAU) {
+    SolColumn &col = solColumns[solSource - SOL_FIRST_TABLEAU];
+    col.count -= solHeldCount;
+    if (!col.count) {
+      col.faceUpFrom = 0;
+    } else if (col.faceUpFrom >= col.count) {
+      // Odkrywamy nowa najwyzsza karte po zabraniu odkrytego ciagu.
+      col.faceUpFrom = col.count - 1;
+    }
+  }
+}
+
+bool solPlace(uint8_t target) {
+  if (solSource < 0 || target == solSource || solWon) return false;
+  const uint8_t first = solHeldFirst();
+  if (target >= SOL_FIRST_FOUNDATION && target < SOL_FIRST_TABLEAU) {
+    const uint8_t suit = target - SOL_FIRST_FOUNDATION;
+    if (solHeldCount != 1 || solSuit(first) != suit ||
+        solRank(first) != solFoundationRank[suit] + 1) return false;
+    solRemoveFromSource();
+    ++solFoundationRank[suit];
+  } else if (target >= SOL_FIRST_TABLEAU && target < SOL_PILE_COUNT) {
+    SolColumn &dest = solColumns[target - SOL_FIRST_TABLEAU];
+    if (!dest.count) {
+      if (solRank(first) != 13) return false; // Tylko krol na puste pole.
+    } else {
+      const uint8_t top = dest.cards[dest.count - 1];
+      if (solRank(top) != solRank(first) + 1 ||
+          solRed(top) == solRed(first)) return false;
+    }
+    // Ochrona przed blednym wyjsciem poza tablice.
+    if (dest.count + solHeldCount > 52) return false;
+    uint8_t moved[52];
+    if (solSource >= SOL_FIRST_TABLEAU) {
+      const SolColumn &src = solColumns[solSource - SOL_FIRST_TABLEAU];
+      for (uint8_t i = 0; i < solHeldCount; ++i)
+        moved[i] = src.cards[src.count - solHeldCount + i];
+    } else {
+      moved[0] = first;
+    }
+    solRemoveFromSource();
+    for (uint8_t i = 0; i < solHeldCount; ++i)
+      dest.cards[dest.count++] = moved[i];
+  } else {
+    return false;
+  }
+  ++solMoves;
+  solCancel();
+  solCheckWon();
+  return true;
+}
+
+void solSelectOrPlace() {
+  if (!solStarted) { newSolitaire(); return; }
+  if (solWon) return;
+  if (solSource >= 0) {
+    if (solCursor == solSource) solCancel();
+    else solPlace(solCursor);
+    return;
+  }
+  if (solCursor == SOL_STOCK) { solDrawStock(); return; }
+  uint8_t card;
+  if (!solTopCard(solCursor, card)) return;
+  solSource = solCursor;
+  solHeldCount = (solSource >= SOL_FIRST_TABLEAU)
+               ? min(solRun, solMaxRun(solSource - SOL_FIRST_TABLEAU)) : 1;
+}
+
+void solButton4() {
+  if (!solStarted || solWon) return;
+  if (solSource >= 0) { solCancel(); return; }
+  if (solCursor >= SOL_FIRST_TABLEAU) {
+    const uint8_t maxRun = solMaxRun(solCursor - SOL_FIRST_TABLEAU);
+    if (maxRun) solRun = solRun >= maxRun ? 1 : solRun + 1;
+  } else {
+    solDrawStock();
+  }
+}
+
+void solAutoFoundation() {
+  if (!solStarted || solWon) return;
+  if (solSource >= 0 && solHeldCount != 1) return;
+  uint8_t source = solSource >= 0 ? solSource : solCursor;
+  uint8_t card;
+  if (!solTopCard(source, card)) return;
+  const uint8_t target = SOL_FIRST_FOUNDATION + solSuit(card);
+  if (solSource < 0) {
+    solSource = source;
+    solHeldCount = 1;
+  }
+  if (!solPlace(target)) {
+    // Automatyczne przeniesienie nie powiodlo sie: nic nie zabieramy.
+    if (source == solCursor) solCancel();
+  }
+}
+
+// Male, czytelne etykiety kart (np. AC = as trefl, TH = 10 kier).
+void solMiniCard(int16_t x, int16_t y, uint8_t card, bool selected) {
+  // Zamaluj poprzednia karte, aby stosy nie nakladaly tekstu na tekst.
+  display.fillRect(x, y, SOL_CARD_W, SOL_CARD_H, SSD1306_BLACK);
+  display.drawRect(x, y, SOL_CARD_W, SOL_CARD_H, SSD1306_WHITE);
+  // Na monochromatycznym OLED mozemy oznaczyc czerwone kolory
+  // dodatkowa kropka: karo/kier maja marker w prawym dolnym rogu.
+  char label[3];
+  solCardText(card, label);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(x + 2, y + 2);
+  display.print(label);
+  if (solRed(card)) display.drawPixel(x + 14, y + 9, SSD1306_WHITE);
+  if (selected) display.drawFastHLine(x, y + 10, SOL_CARD_W, SSD1306_WHITE);
+}
+
+void solDrawPile(int16_t x, uint8_t pile) {
+  const int16_t y = 17;
+  uint8_t card;
+  const bool hasCard = solTopCard(pile, card);
+  if (pile == SOL_STOCK) {
+    display.drawRect(x, y, SOL_CARD_W, SOL_CARD_H, SSD1306_WHITE);
+    if (solStockCount) {
+      display.drawLine(x + 3, y + 2, x + 12, y + 8, SSD1306_WHITE);
+      display.drawLine(x + 3, y + 8, x + 12, y + 2, SSD1306_WHITE);
+    } else {
+      display.setCursor(x + 5, y + 2); display.print("O");
+    }
+  } else if (hasCard) {
+    solMiniCard(x, y, card, false);
+  } else {
+    display.drawRect(x, y, SOL_CARD_W, SOL_CARD_H, SSD1306_WHITE);
+    if (pile >= SOL_FIRST_FOUNDATION) {
+      display.setCursor(x + 5, y + 2);
+      display.print(solSuitChar((pile - SOL_FIRST_FOUNDATION) * 13));
+    }
+  }
+  if (solCursor == pile) display.drawFastHLine(x, 29, SOL_CARD_W, SSD1306_WHITE);
+  if (solSource == pile) display.fillRect(x + 6, 15, 4, 2, SSD1306_WHITE);
+}
+
+void solDrawTableau(uint8_t colNumber) {
+  const SolColumn &col = solColumns[colNumber];
+  const int16_t x = colNumber * 18 + 1;
+  const uint8_t pile = SOL_FIRST_TABLEAU + colNumber;
+  display.setCursor(x + 5, 30);
+  display.print(colNumber + 1);
+  if (solCursor == pile) display.drawFastHLine(x, 37, SOL_CARD_W, SSD1306_WHITE);
+  if (solSource == pile) display.fillRect(x + 11, 30, 3, 3, SSD1306_WHITE);
+  if (!col.count) {
+    display.drawRect(x, SOL_TABLEAU_Y, SOL_CARD_W, SOL_CARD_H, SSD1306_WHITE);
+    return;
+  }
+  // Ograniczona wysokosc OLED: upakowanie stosu gwarantuje,
+  // ze gorna (grana) karta zawsze bedzie widoczna przy dole ekranu.
+  // Zakryte karty sa poziomymi kreskami, odkryte - minikartami.
+  const uint8_t gaps = col.count - 1;
+  const int maxTopY = 64 - SOL_CARD_H;
+  uint8_t step = 3;
+  if (gaps > 0 && gaps * step > maxTopY - SOL_TABLEAU_Y)
+    step = max(1, (maxTopY - SOL_TABLEAU_Y) / gaps);
+  // Bardzo wysokie stosy: wyswietlamy tylko ostatni fragment,
+  // nie tracac mozliwosci przenoszenia kart z wybranego ciagu.
+  const uint8_t shown = min(col.count, (uint8_t)(1 + (maxTopY - SOL_TABLEAU_Y) / step));
+  const uint8_t first = col.count - shown;
+  for (uint8_t i = first; i < col.count; ++i) {
+    const int16_t y = SOL_TABLEAU_Y + (i - first) * step;
+    if (i < col.faceUpFrom) {
+      display.fillRect(x, y, SOL_CARD_W, SOL_CARD_H, SSD1306_BLACK);
+      display.drawRect(x, y, SOL_CARD_W, SOL_CARD_H, SSD1306_WHITE);
+      display.drawFastHLine(x + 3, y + 2, 10, SSD1306_WHITE);
+    } else {
+      solMiniCard(x, y, col.cards[i], false);
+    }
+  }
+  // Liczba kart w wybranym ciagu (B4) i ich poczatek pokazywane
+  // w zoltym naglowku, zeby male nakladajace sie karty nie przeszkadzaly.
+}
+
+void drawSolitaire() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 3);
+  display.print("PASJANS");
+  display.setCursor(51, 3);
+  if (!solStarted) {
+    display.print("B5 START");
+  } else if (solWon) {
+    display.print("WYGRANA!");
+  } else if (solSource >= 0) {
+    char text[3];
+    solCardText(solHeldFirst(), text);
+    display.print("TRZ:");
+    display.print(text);
+    if (solHeldCount > 1) {
+      display.print("x");
+      display.print(solHeldCount);
+    }
+  } else if (solCursor >= SOL_FIRST_TABLEAU &&
+             solColumns[solCursor - SOL_FIRST_TABLEAU].count) {
+    const SolColumn &col = solColumns[solCursor - SOL_FIRST_TABLEAU];
+    char text[3];
+    solCardText(col.cards[col.count - solRun], text);
+    display.print("x");
+    display.print(solRun);
+    display.print(":");
+    display.print(text);
+  } else {
+    display.print("B3 WYB");
+  }
+  // Stos dobierania, stos odkryty i cztery domowe.
+  solDrawPile(1, SOL_STOCK);
+  solDrawPile(19, SOL_WASTE);
+  for (uint8_t i = 0; i < 4; ++i)
+    solDrawPile(55 + 18 * i, SOL_FIRST_FOUNDATION + i);
+  // Kolumny z kartami: 7 x 18 = 126 pikseli.
+  for (uint8_t i = 0; i < 7; ++i) solDrawTableau(i);
+  if (!solStarted || solWon) {
+    display.fillRect(30, 38, 74, 20, SSD1306_BLACK);
+    display.drawRect(30, 38, 74, 20, SSD1306_WHITE);
+    display.setCursor(solWon ? 42 : 39, 44);
+    display.print(solWon ? "WYGRANA!" : "B5 START");
+  }
+  display.display();
+}
+
+// ============================================================
 // STEROWANIE I PRZELACZANIE TRYBOW
 // ============================================================
 void nextMode() {
   if (mode == CLOCK_MODE) mode = CALENDAR_MODE;
   else if (mode == CALENDAR_MODE) mode = TETRIS_MODE;
   else if (mode == TETRIS_MODE) mode = SNAKE_MODE;
+  else if (mode == SNAKE_MODE) mode = SOLITAIRE_MODE;
   else mode = CLOCK_MODE;
   // Gry pozostaja zamrozone podczas korzystania z innych trybow.
   lastFall = millis();
@@ -568,6 +970,14 @@ void handlePress(uint8_t b) {
       // B5 (b==4) jest obslugiwany dopiero przy PUSZCZENIU,
       // aby odroznic krotkie klikniecie od dlugiego przytrzymania.
     }
+  } else if (mode == SOLITAIRE_MODE) {
+    switch (b) {
+      case 0: solSetCursor(-1); break;
+      case 1: solSetCursor(+1); break;
+      case 2: solSelectOrPlace(); break;
+      case 3: solButton4(); break;
+      // B5: automat do stosu domowego, dlugie: nowa rozgrywka.
+    }
   } else if (mode == SNAKE_MODE) {
     switch (b) {
       case 0: snakeTurn(-1); break;  // Skret wzgledem kierunku jazdy
@@ -584,6 +994,9 @@ void handleRepeat(uint8_t b) {
     if (b <= 3) handlePress(b);
   } else if (mode == CALENDAR_MODE) {
     if (b <= 4) handlePress(b);
+  } else if (mode == SOLITAIRE_MODE) {
+    if (b == 0) solSetCursor(-1);
+    if (b == 1) solSetCursor(+1);
   } else if (mode == TETRIS_MODE) {
     if (b == 0) movePiece(-1);
     if (b == 1) movePiece(1);
@@ -598,6 +1011,11 @@ void shortSnakeButton5() {
     snakePaused = !snakePaused;
     lastSnakeStep = millis(); // Pelny odstep po wznowieniu.
   }
+}
+
+void shortSolitaireButton5() {
+  if (!solStarted) newSolitaire();
+  else solAutoFoundation();
 }
 
 void shortTetrisButton5() {
@@ -639,13 +1057,16 @@ void loop() {
   // B5 w grach: restart na przytrzymanie, klik dopiero po puszczeniu.
   // Przycisk zmiany trybu B6 dziala na pojedyncze nacisniecie.
   for (uint8_t i = 0; i < 6; ++i) {
-    if (i == 4 && (mode == TETRIS_MODE || mode == SNAKE_MODE)) {
+    if (i == 4 && (mode == TETRIS_MODE || mode == SNAKE_MODE || mode == SOLITAIRE_MODE)) {
       if (mode == TETRIS_MODE) {
         if (buttons[i].longEvent) newGame();
         if (buttons[i].releaseEvent && !buttons[i].longSent) shortTetrisButton5();
-      } else {
+      } else if (mode == SNAKE_MODE) {
         if (buttons[i].longEvent) newSnakeGame();
         if (buttons[i].releaseEvent && !buttons[i].longSent) shortSnakeButton5();
+      } else {
+        if (buttons[i].longEvent) newSolitaire();
+        if (buttons[i].releaseEvent && !buttons[i].longSent) shortSolitaireButton5();
       }
       continue;
     }
@@ -664,7 +1085,8 @@ void loop() {
     if (mode == CLOCK_MODE) drawClock();
     else if (mode == CALENDAR_MODE) drawCalendar();
     else if (mode == TETRIS_MODE) drawTetris();
-    else drawSnake();
+    else if (mode == SNAKE_MODE) drawSnake();
+    else drawSolitaire();
   }
   delay(1);
 }
